@@ -1,0 +1,309 @@
+#!/bin/bash
+
+# use -x on the cli for debugging
+[ "$1" = "-x" ] && set -x && shift 1
+
+# This script can connect to Linux, Unix or Windows servers by using ssh, ssh or xfreerdp,
+# and to internal and external websites and showing files or folders.
+# You can even send Email or open a ftp session, run local commands, start a vnc(viewer) session or search google.com
+#
+# .goxrc is keeping the default screen size for Windows sessions as well as a prerequirements check and
+# the minimum size of the history file and last day is was cleaned, the default Windows and SSH user and Windows domain.
+#
+# non-default connections are kept in .goxhosts, some examples are in the file
+#
+# history of connections to servers is kept in .goxhistory
+#
+# Copyright (c) 2011-2025 Albert van Alphen (albert.vanalphen@gmail.com)
+#
+VERSION="7.3.4 (February 2025)"
+
+# showing some info
+function SHOW_HELP {
+yad --image=help --title=gox --button=close --text="Usage: $0 [-?|-h] [-v] [-c] [server|terminal][URL][document][folder][command][g:search query][mailto:email-address]
+
+The next options can only be used from the commandline:
+
+-c  connect to the Windows Console
+-v  show version
+-?|-h  shows this info screen
+
+(\"help\" or \"?\" in the GUI also shows this help info)
+
+The following arguments can be used:
+
+server|terminal  (e.g. servername, 10.31.8.10, servername.domainname.nl)
+document  (e.g. /home/ava/Documents/documentname.doc, ~/Documents/documentname.doc)
+folder  (e.g. /home/ava/tmp, ~/tmp)
+command  (e.g. gedit, gvim ~/bin/filename)
+email  (e.g. mailto:albert.vanalphen@gmail.com)
+search  (e.g. g[oogle]:where can i find steinweg rotterdam)
+URL  (e.g. https://www.google.com, www.google.com, ftp://ftp.domainname.com)"
+}
+
+function _VERSION {
+yad --image=about --title=gox --button=close --text="version: $VERSION
+
+Copyright (C) 2012-2024 Albert van Alphen
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+
+Written by Albert van Alphen (albert.vanalphen@gmail.com)"
+}
+
+function _SECRET {
+PASSWORD="$(yad --title="Password" --text="Enter password for user <b>$USR</b>:" --image="dialog-password" --entry --hide-text)"
+[ -z "$PASSWORD" ] && yad --center --image=error --title=ERROR --button=close --text="Password is required" && exit 1 || PASSWD="/p:$PASSWORD"
+}
+
+while getopts :vch opt
+do
+  case $opt in
+		c) OS=W ; FLAG=/admin ;;
+		v) _VERSION ;;
+		h) SHOW_HELP ; exec "$0" ;;
+		\?) echo "Invalid option: -$OPTARG" >&2; SHOW_HELP ; exec "$0" ;;
+  esac
+done
+shift "$((OPTIND-1))"
+
+function _ADD_HIST {
+# add command to history unless HIST_SIZE is 0 (= keep no history)
+if [ "$HIST_SIZE" -ne 0 ]
+then
+	if [ "$(grep -c "$FOCUS" "$HISTFILE")" -eq 0 ]
+	then
+		echo "${FOCUS_ORIG:-$FOCUS}" >> "$HISTFILE"
+	fi
+fi
+}
+
+# declaration of some variables
+RC="$HOME"/.goxrc
+EXCEPTIONS="$HOME"/.goxhosts
+HISTFILE="$HOME"/.goxhistory
+
+# check for requirements
+CHK_REQ=$(awk 'BEGIN {FS="="} $1~/^CHK_REQ$/ {print $2}' "$RC" 2>/dev/null)
+if [ "$CHK_REQ" != "done" ]
+then
+	echo "dependencies check ..."
+	for REQUIRED in xfreerdp gnome-terminal xdg-open yad vncviewer nmap ssh
+	do
+		echo -en "looking for $REQUIRED ... "
+		[ ! "$(which "$REQUIRED" 2>/dev/null)" ] && echo -e " NOT INSTALLED
+$REQUIRED is missing, and can't continue without it.
+Install $REQUIRED (e.g.: sudo apt install $REQUIRED) and try again" && exit 1
+		echo "OK"
+	done
+	[ ! -e "$EXCEPTIONS" ] && yad --image=info --title=gox --button=ok --center --text="creating $EXCEPTIONS file with some examples for non-default connections"  && echo "# for any fields leaved blank default values will be used
+# HTTP(S) SESSIONS
+# Alias|C|URL|
+# intranet|C|https://servername.domainname.nl
+#
+# SSH/RDESKTOP SESSIONS
+# Alias|OS W(indows) or L(inux)|FQDN|USER (for both OS)|DOMAIN (for W only)|CONSOLE (for W only)|GEO (for W only)
+# servername|L|servername.domainname.com|root
+# servername|W||vrc|servername|Console|1280x1024" >> "$EXCEPTIONS"
+
+	echo CHK_REQ=done >> "$RC"
+	yad --title=gox --image=info --button=ok --center --text="requirements check done and written to $RC"
+	yad --title=gox --image=info --button=ok --center --text="TIP: create a keyboard shortcut for gox, e.g.: Ctrl+Alt+G"
+fi
+
+# history file things
+[ ! -e "$HISTFILE" ] && touch "$HISTFILE" && yad --title=gox --image=info --button=ok --center --text="created history file $HISTFILE"
+# Last cleaned
+CLN_HIST=$(awk 'BEGIN {FS="="} $1~/^CLN_HIST$/ {print $2}' "$RC" 2>/dev/null)
+# How many lines do we have
+HIST_SIZE=$(awk 'BEGIN {FS="="} $1~/^HIST_SIZE$/ {print $2}' "$RC" 2>/dev/null)
+[ -z "$HIST_SIZE" ] && HIST_SIZE=$(yad --title=gox --image="logview" --entry --title="History file size" --center --text="Minimum entries to keep (0 = history off)" --button=ok --entry-text="100") && echo "HIST_SIZE=$HIST_SIZE" >> "$RC" &&  yad --title=gox --image=info --button=ok --center --text="History size written to $RC"
+# if not cleaned yet do so now
+if [ "$CLN_HIST" != "$(date +%d%m%y)" ]
+then
+	[ "$(wc -l "$HISTFILE"|cut -f1 -d" ")" -gt "$HIST_SIZE" ] && tail --lines="$HIST_SIZE" "$HISTFILE" > "$HISTFILE".new && mv "$HISTFILE".new "$HISTFILE" && yad --title=gox --image=info --text="History file cleaned" --timeout=1 --no-buttons
+	[ -n "$CLN_HIST" ] && sed -e /CLN_HIST="$CLN_HIST"/d "$RC" > "$RC"_new && mv "$RC"_new "$RC"
+	echo "CLN_HIST=$(date +%d%m%y)" >> "$RC"
+fi
+
+# asking what to do
+if [ -z "$1" ]
+then
+	CMD='yad --center --image="execute" --title="gox" --text="Give server, command or URL etc. (type \"help\" for more info)" --entry --editable --completion'
+# getting history
+	HIST=$(perl -pe 's/(^.*$)/"\1"/;s/\n/ /' "$HISTFILE")
+	FOCUS=$(eval "$CMD" "$HIST")
+	[ $? -ne 0 ] && exit 0 || [ -z "${FOCUS%% *}" ] && yad --center --image=error --title=ERROR --button=close:2 --text="   No input" --width=150 ; [ $? -eq 2 ] && exit 0
+else
+	FOCUS=$(echo "$@"|tr "[:upper:]" "[:lower:]")
+fi
+
+# is it a command we want to run?
+LOCAL_COMMAND=$(which "${FOCUS%% *}" 2>/dev/null)
+if [ -n "$LOCAL_COMMAND" ]
+then
+	OPTION=$(echo "$FOCUS"|cut -f2- -d" " -s)
+	if [ -n "$OPTION" ] 
+	then 
+		[ "$(echo "$OPTION"|cut -c1)" = "~" ] && OPTION="$HOME"${OPTION#~*}
+		$LOCAL_COMMAND "$OPTION" 
+	else 
+		$LOCAL_COMMAND
+	fi
+	_ADD_HIST
+	[ $? -ne 0 ] && yad --center --image=error --title=ERROR --button=close:2 --text="Unknown error" --width=175 ; exit 0
+fi
+
+# it is not a command so check what else
+if [ "${FOCUS%:*}" = https ] || [ "${FOCUS%:*}" = ftp ] || [ "${FOCUS%:*}" = mailto ]
+then
+	xdg-open "$FOCUS"
+	_ADD_HIST
+	[ $? -ne 0 ] && yad --center --image=error --title=ERROR --button=close:2 --text="Unknown error" --width=175 ; exit 0
+elif [ "${FOCUS%%.*}" = www ]
+then
+	xdg-open https://"$FOCUS"
+	_ADD_HIST
+	[ $? -ne 0 ] && yad --center --image=error --title=ERROR --button=close:2 --text="Unknown error" --width=175 ; exit 0
+elif [ "$(echo "$FOCUS"|cut -c1)" = "/" ] || [ "$(echo "$FOCUS"|cut -c1)" = "~" ]
+then
+	[ "$(echo "$FOCUS"|cut -c1)" = "~" ] && FOCUS="$HOME"${FOCUS#~*}
+	[ -e "$FOCUS" ] && xdg-open "$FOCUS" && _ADD_HIST && exit 0 || yad --center --image=error --title=ERROR --button=close --text="file or folder $FOCUS does not exist" && exec "$0" 
+elif [ "${FOCUS%%:*}" = google ] || [ "${FOCUS%%:*}" = g ]
+then
+	SEARCH=$(echo "$FOCUS"|cut --delimiter=: --fields=2-)
+	xdg-open https://www.google.com/search?q="$SEARCH"
+	_ADD_HIST
+	[ $? -ne 0 ] && yad --center --image=error --title=ERROR --button=close:2 --text="Unknown error" --width=175 ; exit 0
+elif [ "$FOCUS" = "?" ] || [ "$FOCUS" = help ]
+then
+	SHOW_HELP
+	exec "$0"
+else
+  PREFIX="${FOCUS%%.*}"
+	case $PREFIX in
+	l|local|shell)
+		gnome-terminal -- bash ; exit 0 ;;
+	esac
+fi
+
+# own defined URL?
+COMM=$(awk 'BEGIN {FS="|"} $1~/^'"$PREFIX"'$/ {print $2}' "$EXCEPTIONS" 2>/dev/null)
+if [ "$COMM" = C ] 
+then
+	COMMAND=$(awk 'BEGIN {FS="|"} $1~/^'"$PREFIX"'$/ {print $3}' "$EXCEPTIONS" 2>/dev/null)
+	xdg-open "$COMMAND" 
+	_ADD_HIST
+	[ $? -ne 0 ] && yad --center --image=error --title=ERROR --button=close:2 --text="Unknown error" --width=175 ; exit 0
+fi
+
+# perhaps we want to connect to a (local) server
+FOCUS_ORIG="$FOCUS"
+FOCUS_CHK=$(awk 'BEGIN {FS="|"} $1~/^'"$FOCUS"'$/ {print $3}' "$EXCEPTIONS" 2>/dev/null)
+if [ -z "$FOCUS_CHK" ]
+then
+	FOCUS=$(host "$FOCUS"|awk 'END {print $5}') 
+	[ -z "$FOCUS" ] || [ "$FOCUS" = "Host" ] || [ "$FOCUS" = "2(SERVFAIL)" ] && yad --image=error --center --title=ERROR --button=close --text="command|system \"$FOCUS\" can not be found" && exec "$0"
+else
+	FOUND=Y
+	OS=$(awk 'BEGIN {FS="|"} $1~/^'"$FOCUS"'$/ {print $2}' "$EXCEPTIONS" 2>/dev/null)
+fi
+
+# finding out which OS
+if [ -z "$OS" ] 
+then
+	nmap -T5 -F -Pn "$FOCUS" 1>/tmp/$$
+	# we test on: ssh, windows, vnc, telnet, https and http
+	for SERVICES in ssh ms-wbt-server vnc telnet https http
+	do
+		OS_CNT=$(awk '$3~/^'"$SERVICES"'$/ {print "'"$SERVICES"'"}' /tmp/$$)
+		if [ -n "$OS_CNT" ]
+		then
+			case "$SERVICES" in
+				ssh) OS=L ; break ;;
+				telnet) OS=E ; break ;;
+				vnc) OS=V ; break ;;
+				ms-wbt-server) OS=W ; break ;;
+				https) OS=H1 ; break ;;
+				http) OS=H2 ; break ;;
+			esac
+		fi
+	done
+	rm -f /tmp/$$
+	[ -z "$OS" ] && yad --center --image=error --title=ERROR --button=close --text="could not establish connection with \"$FOCUS\"" && exit 1
+fi
+
+# Getting the Non-Default Window settings from the exeption file if there are any
+if [ "$OS" = "W" ]
+then
+	# getting Windows logon details
+ 	DOMAIN_ND=$(awk 'BEGIN {FS="|"} $1~/^'"$PREFIX"'$/ {print $5}' "$EXCEPTIONS" 2>/dev/null)
+	if [ -n "$DOMAIN_ND" ] 
+	then
+		DOMAIN="$DOMAIN_ND"
+	else
+		DOMAIN=$(awk 'BEGIN {FS="="} $1~/^DOMAIN$/ {print $2}' "$RC" 2>/dev/null)
+		[ -z "$DOMAIN" ] && DOMAIN=$(yad --title=gox --image="avatar-default" --entry --title="Default Windows Domain" --text="Give default Windows Domain" --button=ok --entry-text="w2k") && echo DOMAIN="$DOMAIN" >> "$RC" &&  yad --title=gox --image=info --button=ok --center --text="default Windows Domain written to $RC"
+	fi
+
+ 	USR_ND=$(awk 'BEGIN {FS="|"} $1~/^'"$PREFIX"'$/ {print $4}' "$EXCEPTIONS" 2>/dev/null)
+	if [ -n "$USR_ND" ] 
+	then
+		USR="$USR_ND"
+	else
+		USR=$(awk 'BEGIN {FS="="} $1~/^USR$/ {print $2}' "$RC" 2>/dev/null)
+		[ -z "$USR" ] && USR=$(yad --title=gox --image="avatar-default" --entry --title="Default Windows User" --text="Give default Windows User" --button=ok --entry-text="administrator") && echo USR="$USR" >> "$RC" &&  yad --title=gox --image=info --button=ok --center --text="default Windows User written to $RC"
+	fi
+
+	# getting Windows screen size
+ 	GEO_ND=$(awk 'BEGIN {FS="|"} $1~/^'"$PREFIX"'$/ {print $7}' "$EXCEPTIONS" 2>/dev/null)
+	if [ -n "$GEO_ND" ] 
+	then
+		GEO="$GEO_ND"
+ 	else
+		GEO=$(awk 'BEGIN {FS="="} $1~/^GEO$/ {print $2}' "$RC" 2>/dev/null)
+		[ -z "$GEO" ] && GEO=$(yad --title=gox --image="display" --entry --title="Default screen size" --text="Give default screen size for Windows sessions, enter F for full screen" --button=ok --entry-text="1920x1080") && echo GEO="$GEO" >> "$RC" &&  yad --title=gox --image=info --button=ok --center --text="default size written to $RC"
+	fi
+	[ "$GEO" = "F" ] && SIZE=/f || SIZE=/size:"$GEO"
+
+	[ -z "$FLAG" ] && FLAG=$(awk 'BEGIN {FS="|"} $1~/^'"$PREFIX"'$/ {print $6}' "$EXCEPTIONS" 2>/dev/null)
+	[ "$FLAG" = "/admin" ] || [ "$FLAG" = "CONSOLE" ] && yad --title=INFO --image=emblem-important --center --timeout=1 --no-buttons --text="Connecting to Console" && FLAG=/admin
+
+elif [ "$OS" = "E" ]
+then
+	telnet $"$FOCUS"
+	_ADD_HIST
+
+elif [ "$OS" = "L" ]
+then
+	SSH_USR=$(awk 'BEGIN {FS="|"} $1~/^'"$PREFIX"'$/ {print $4}' "$EXCEPTIONS" 2>/dev/null)
+	if [ -n "$SSH_USR" ] 
+	then
+		USR=$SSH_USR 
+	else
+		SSH_USR=root
+		USR=$SSH_USR 
+	fi
+
+elif [ "${OS%[12]*}" = "H" ]
+then
+	xdg-open "${SERVICES:=https}"://"$FOCUS/"
+	_ADD_HIST
+	exit 0
+fi
+
+# writing all found variables to the exception file so next quicker access
+[ "$FOUND" != "Y" ] && echo "${FOCUS}|${OS}|${FOCUS}|${USR}|${DOMAIN}|${FLAG}|${GEO}|" >> "$EXCEPTIONS"
+
+# "default" connections, place exceptions in .goxhosts
+case $OS in
+V) 
+	vncviewer --WarnUnencrypted=0 "$FOCUS" && _ADD_HIST ;;
+L)
+	gnome-terminal -- ssh -X -l $SSH_USR $FOCUS && _ADD_HIST ;;
+W)
+	_SECRET
+	xfreerdp +fonts /v:"$FOCUS" "$SIZE" /bpp:32 /kbd:0x00000409 /d:"$DOMAIN" /u:"$USR" "$PASSWD" +clipboard /cert-ignore /network:lan "$FLAG" && _ADD_HIST ;;
+T)
+	gnome-terminal -- ssh $FOCUS && _ADD_HIST ;;
+esac
